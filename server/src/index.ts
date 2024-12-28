@@ -4,16 +4,16 @@ import cors from 'cors';
 import { MessageService } from './services/messageService';
 import { WSServer } from './websocket/wsServer';
 import { Message } from './types/message';
+import { config } from './config';
+import { logger } from './utils/logger';
+import 'dotenv/config';
 
 const app = express();
-const PORT = 3001;
-const WS_PORT = 3002;
-const MONGO_URL = 'mongodb://localhost:27017';
 
 async function bootstrap() {
-  const mongoClient = await MongoClient.connect(MONGO_URL);
+  const mongoClient = await MongoClient.connect(config.mongoUrl);
   const messageService = new MessageService(mongoClient);
-  const wsServer = new WSServer(WS_PORT);
+  const wsServer = new WSServer(config.wsPort);
 
   app.use(cors());
   app.use(express.json());
@@ -28,7 +28,7 @@ async function bootstrap() {
       await messageService.addMessage(message);
       res.status(202).json({ message: 'Message accepted' });
     } catch (error) {
-      console.error('Error adding message:', error);
+      logger.error('Error adding message:', error);
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -38,7 +38,7 @@ async function bootstrap() {
       const messages = await messageService.getAllMessages();
       res.json(messages);
     } catch (error) {
-      console.error('Error getting messages:', error);
+      logger.error('Error getting messages:', error);
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -47,14 +47,14 @@ async function bootstrap() {
     wsServer.broadcastMessage(message);
   });
 
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  app.listen(config.port, () => {
+    logger.info(`Server running on port ${config.port}`);
   });
 
-  // Graceful shutdown
   const shutdown = async () => {
-    console.log('Shutting down...');
+    logger.info('Shutting down...');
     await mongoClient.close();
+    wsServer.shutdown();
     process.exit(0);
   };
 
@@ -62,4 +62,7 @@ async function bootstrap() {
   process.on('SIGTERM', shutdown);
 }
 
-bootstrap().catch(console.error); 
+bootstrap().catch((error) => {
+  logger.error('Bootstrap error:', error);
+  process.exit(1);
+}); 

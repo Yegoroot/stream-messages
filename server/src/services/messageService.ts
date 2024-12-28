@@ -3,23 +3,44 @@ import { Message } from '../types/message';
 import EventEmitter from 'events';
 import fs from 'fs';
 import path from 'path';
+import { logger } from '../utils/logger';
+import { config } from '../config';
 
 export class MessageService extends EventEmitter {
   private messages: Message[] = [];
   private collection: Collection<Message>;
   private batchTimeout: NodeJS.Timeout | null = null;
-  private readonly BATCH_SIZE = 10;
-  private readonly BATCH_TIMEOUT = 1000;
+  private readonly BATCH_SIZE = config.batchSize;
+  private readonly BATCH_TIMEOUT = config.batchTimeout;
   private readonly BACKUP_FILE = path.join(__dirname, '../data/pending-messages.json');
   private isFlushInProgress = false;
+  private reconnectAttempts = 0;
+  private readonly MAX_RECONNECT_ATTEMPTS = 5;
 
   constructor(private mongoClient: MongoClient) {
     super();
-    this.collection = this.mongoClient.db('messageApp').collection('messages');
+    this.collection = this.mongoClient.db(config.dbName).collection('messages');
     this.loadPendingMessages();
+    this.setupShutdownHandlers();
+  }
 
-    process.on('SIGINT', () => this.handleShutdown());
-    process.on('SIGTERM', () => this.handleShutdown());
+  private setupShutdownHandlers() {
+    const shutdown = async () => {
+      logger.info('Shutting down MessageService...');
+      try {
+        if (this.messages.length > 0) {
+          await this.savePendingMessages();
+        }
+        await this.mongoClient.close();
+        logger.info('MessageService shutdown complete');
+      } catch (error) {
+        logger.error('Error during shutdown:', error);
+      }
+      process.exit(0);
+    };
+
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 
   private async handleShutdown() {
@@ -59,20 +80,26 @@ export class MessageService extends EventEmitter {
   }
 
   async addMessage(message: Message): Promise<void> {
-    this.messages.push(message);
-    
-    if (this.isFlushInProgress) {
-      return;
-    }
-    
-    if (this.messages.length === 1) {
-      this.batchTimeout = setTimeout(() => this.flushMessages(), this.BATCH_TIMEOUT);
-    } else if (this.messages.length >= this.BATCH_SIZE) {
-      if (this.batchTimeout) {
-        clearTimeout(this.batchTimeout);
-        this.batchTimeout = null;
+    try {
+      this.messages.push(message);
+      logger.debug(`Message added to buffer. Buffer size: ${this.messages.length}`);
+      
+      if (this.isFlushInProgress) {
+        return;
       }
-      await this.flushMessages();
+      
+      if (this.messages.length === 1) {
+        this.batchTimeout = setTimeout(() => this.flushMessages(), this.BATCH_TIMEOUT);
+      } else if (this.messages.length >= this.BATCH_SIZE) {
+        if (this.batchTimeout) {
+          clearTimeout(this.batchTimeout);
+          this.batchTimeout = null;
+        }
+        await this.flushMessages();
+      }
+    } catch (error) {
+      logger.error('Error adding message:', error);
+      throw error;
     }
   }
 
@@ -80,7 +107,7 @@ export class MessageService extends EventEmitter {
     if (this.messages.length === 0 || this.isFlushInProgress) return;
 
     this.isFlushInProgress = true;
-    let messagesToInsert: Message[] = [];
+    let messagesToInsert = [...this.messages];
 
     try {
       if (this.batchTimeout) {
@@ -91,9 +118,9 @@ export class MessageService extends EventEmitter {
       messagesToInsert = [...this.messages];
       this.messages = [];
 
+      logger.info(`Flushing ${messagesToInsert.length} messages to database`);
       const result = await this.collection.insertMany(messagesToInsert);
       
-      // Отправляем события о новых сообщениях после успешной вставки
       messagesToInsert.forEach((message, index) => {
         const insertedMessage = {
           ...message,
@@ -101,10 +128,21 @@ export class MessageService extends EventEmitter {
         };
         this.emit('newMessage', insertedMessage);
       });
+
+      logger.info(`Successfully flushed ${messagesToInsert.length} messages`);
+      this.reconnectAttempts = 0;
     } catch (error) {
-      // Возвращаем сообщения обратно в очередь
+      logger.error('Error flushing messages:', error);
       this.messages = [...messagesToInsert, ...this.messages];
-      throw error;
+      
+      if (this.reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS) {
+        this.reconnectAttempts++;
+        logger.info(`Retrying flush in ${this.reconnectAttempts * 1000}ms`);
+        setTimeout(() => this.flushMessages(), this.reconnectAttempts * 1000);
+      } else {
+        logger.error('Max reconnection attempts reached');
+        throw error;
+      }
     } finally {
       this.isFlushInProgress = false;
     }
